@@ -1,0 +1,272 @@
+import streamlit as st
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import os
+import shutil
+import json
+import re
+import datetime
+import pandas as pd
+
+from update_engine import run_bulk_download, run_bulk_parse, wipe_period
+
+# --- BigQuery Connection Setup ---
+@st.cache_resource
+def get_bq_client():
+    """Initializes a BigQuery client using Streamlit secrets."""
+    credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+    return bigquery.Client(credentials=credentials, project=credentials.project_id)
+
+client = get_bq_client()
+DATASET = st.secrets.get("BQ_DATASET", "ffiec_data")
+PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
+
+def get_latest_parsed_date():
+    """Queries the BigQuery migration_log for the most recent COMPLETED report."""
+    query = f"""
+        SELECT MAX(report_date) as max_date 
+        FROM `{PROJECT_ID}.{DATASET}.migration_log` 
+        WHERE status = 'COMPLETED'
+    """
+    try:
+        query_job = client.query(query)
+        result = query_job.to_dataframe()
+        if not result.empty and result['max_date'].iloc[0]:
+            # Convert the BigQuery result safely to a python date
+            return pd.to_datetime(result['max_date'].iloc[0]).date()
+    except Exception:
+        pass 
+    
+    return datetime.datetime.now().date()
+
+# Setup the Home Page
+st.set_page_config(page_title="FFIEC Toolkit", page_icon="🦅", layout="centered")
+
+# W&M styled header
+st.markdown("<h1 style='text-align: center; color: #115740;'>🦅 FFIEC Toolkit</h1>", unsafe_allow_html=True)
+st.markdown("<h4 style='text-align: center; color: #222222; margin-bottom: 40px;'>Centralized Financial Institution Data Explorer</h4>", unsafe_allow_html=True)
+
+st.write("Welcome to the FFIEC Toolkit. Use the modules below to query historical call reports, extract XBRL tags, or update your local database.")
+
+st.markdown("---")
+
+# ==========================================
+# TOOL 1: FETCH TOOL (Existing)
+# ==========================================
+st.subheader("1. API Fetch Tool")
+st.write("Query the local database for historical call reports and definitions.")
+
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    if st.button("Launch Fetch Tool", type="primary", use_container_width=True):
+        st.switch_page("pages/1_Fetch_Tool.py")
+
+st.markdown("---")
+
+# ==========================================
+# TOOL 2: UPDATE DATABASE TOOL (New)
+# ==========================================
+st.subheader("2. Bulk Update Database Tool")
+st.write("Download historical .zip bundles from the FFIEC website and parse them directly into the local SQL database.")
+
+# --- UPDATE MODE TOGGLE ---
+update_mode = st.radio("Select Update Mode:", 
+                       ["Smart Catch-up (Auto-detect missing updates)", "Specific Date Range"],
+                       horizontal=True)
+
+if update_mode == "Specific Date Range":
+    mode_flag = "range"
+    
+    # Configuration for our Quarter dropdowns
+    QUARTER_MAP = {
+        "Q1 (March 31)": (3, 31),
+        "Q2 (June 30)": (6, 30),
+        "Q3 (September 30)": (9, 30),
+        "Q4 (December 31)": (12, 31)
+    }
+    quarter_options = list(QUARTER_MAP.keys())
+    
+    # Configuration for our Year dropdowns (Current Year down to 2001)
+    current_year = datetime.datetime.now().year
+    year_options = list(range(current_year, 2000, -1))
+    
+    # Get the smart default from JSON to pre-populate the dropdowns
+    default_date = get_latest_parsed_date()
+    default_year = default_date.year if default_date.year in year_options else current_year
+    
+    # Determine which quarter the default date falls into
+    if default_date.month <= 3: default_q_idx = 0
+    elif default_date.month <= 6: default_q_idx = 1
+    elif default_date.month <= 9: default_q_idx = 2
+    else: default_q_idx = 3
+
+    # Layout: 4 columns side-by-side for Start and End selections
+    st.markdown("##### Select Date Range")
+    c1, c2, c3, c4 = st.columns(4)
+    
+    with c1:
+        start_year = st.selectbox("Start Year", year_options, index=year_options.index(default_year))
+    with c2:
+        start_q = st.selectbox("Start Quarter", quarter_options, index=default_q_idx)
+    with c3:
+        end_year = st.selectbox("End Year", year_options, index=year_options.index(default_year))
+    with c4:
+        end_q = st.selectbox("End Quarter", quarter_options, index=default_q_idx)
+        
+    # Translate the dropdown selections back into actual datetime objects
+    start_month, start_day = QUARTER_MAP[start_q]
+    start_date = datetime.date(start_year, start_month, start_day)
+    
+    end_month, end_day = QUARTER_MAP[end_q]
+    end_date = datetime.date(end_year, end_month, end_day)
+
+    # Validation: Ensure End Date is >= Start Date
+    if start_date > end_date:
+        st.error(f"Invalid Range: End Date ({end_date.strftime('%m/%d/%Y')}) cannot be before Start Date ({start_date.strftime('%m/%d/%Y')}).")
+        st.stop() # Halts script execution so the download button won't run
+
+else:
+    mode_flag = "smart"
+    st.info("**Smart Catch-up:** The tool will scan the FFIEC server, compare the available dates to your local database, and automatically download/parse only the reports you are missing.")
+    start_date = None
+    end_date = None
+
+if st.button("Start Bulk Download & Parse", use_container_width=True):
+    # Setup Temporary Directory
+    TEMP_DIR = os.path.join(os.getcwd(), "temp_bulk_downloads")
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+    
+    # Setup UI Elements for Progress
+    status_text = st.empty()
+    progress_bar = st.progress(0.0)
+    
+    try:
+        # --- PHASE 1: DOWNLOADING ---
+        # The datetime objects from our dropdowns are formatted exactly how update_engine expects them
+        str_start = start_date.strftime("%m/%d/%Y") if mode_flag == "range" else None
+        str_end = end_date.strftime("%m/%d/%Y") if mode_flag == "range" else None
+        
+        status_text.info("Starting browser for download...")
+        for status_msg, progress_pct in run_bulk_download(TEMP_DIR, mode=mode_flag, start_date_str=str_start, end_date_str=str_end):
+            status_text.text(f"Downloading: {status_msg}")
+            progress_bar.progress(progress_pct * 0.5) 
+            
+        # --- PHASE 2: PARSING & SQL PUSH ---
+        status_text.info("Downloads complete. Starting XML parsing and SQL insertion...")
+        for status_msg, progress_pct in run_bulk_parse(TEMP_DIR, client, PROJECT_ID, DATASET):
+            status_text.text(f"Parsing: {status_msg}")
+            progress_bar.progress(0.5 + (progress_pct * 0.5))
+
+        # --- COMPLETION ---
+        progress_bar.progress(1.0)
+        status_text.success("Database successfully updated!")
+        st.balloons()
+
+    except Exception as e:
+        status_text.error(f"❌ Process Failed: {e}")
+        st.exception(e) # Show full traceback in the app for debugging
+
+    finally:
+        # Cleanup
+        status_text.write("Cleaning up temporary files...")
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        status_text.write("Cleanup complete. Ready for next task.")
+st.markdown("---")
+
+
+# ==========================================
+# TOOL 3: Smart Search (beta)
+# ==========================================
+st.subheader("3. LLM Assist")
+st.write("Query the local database using Natural Language prompts.")
+
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    if st.button("Launch LLM Tool", type="primary", use_container_width=True):
+        st.switch_page("pages/3_Smart_Search.py")
+
+st.markdown("---")
+
+# ==========================================
+# TOOL 4: DATABASE MAINTENANCE
+# ==========================================
+st.subheader("🛠️ Database Maintenance")
+st.write("Manage database health, deduplicate records, or reset specific periods.")
+
+with st.expander("Show Maintenance Tools"):
+    m_col1, m_col2 = st.columns(2)
+
+    with m_col1:
+        st.markdown("### 🧹 Clean Data")
+        st.write("Remove exact duplicate records from the financials table to ensure data integrity.")
+        # Fixed height spacer to align buttons
+        st.markdown("<div style='height: 45px;'></div>", unsafe_allow_html=True)
+
+        if st.button("Run Global Deduplication", use_container_width=True):
+            # This SQL pattern identifies duplicates and deletes all but one
+            sql = f"""
+            CREATE OR REPLACE TABLE `{PROJECT_ID}.{DATASET}.call_reports_financials` AS
+            SELECT DISTINCT * FROM `{PROJECT_ID}.{DATASET}.call_reports_financials`
+            """
+            try:
+                client.query(sql).result()
+                st.success("Deduplication complete via table overwrite!")
+            except Exception as e:
+                st.error(f"Deduplication failed: {e}")
+
+    with m_col2:
+        st.markdown("### 🔄 Reset Data")
+        st.write("Wipe all data for a specific period. Use this if a download was corrupted or partial.")
+
+        # Fetch available dates from BigQuery
+        date_options = []
+        with st.spinner("🔍 Checking BigQuery for available periods..."):
+            try:
+                all_dates = set()
+                
+                # 1. Check financials table
+                fin_query = f"SELECT DISTINCT report_date FROM `{PROJECT_ID}.{DATASET}.call_reports_financials`"
+                try:
+                    fin_res = client.query(fin_query).to_dataframe()
+                    all_dates.update(fin_res['report_date'].tolist())
+                except Exception: 
+                    pass
+                
+                # 2. Check migration log
+                log_query = f"SELECT DISTINCT report_date FROM `{PROJECT_ID}.{DATASET}.migration_log`"
+                try:
+                    log_res = client.query(log_query).to_dataframe()
+                    all_dates.update(log_res['report_date'].tolist())
+                except Exception: 
+                    pass
+                
+                # Sort dates (BigQuery dates often come back as strings or date objects)
+                date_options = sorted(list(all_dates), reverse=True)
+            except Exception as e:
+                st.error(f"Error fetching dates: {e}")
+
+        selected_wipe = st.selectbox("Select Period", options=date_options if date_options else ["No data found"])
+        
+        if not date_options:
+            st.info("💡 No report dates found in the database. Run a download first!")
+
+        if st.button("Wipe Selected Period", type="secondary", use_container_width=True, disabled=not date_options):
+            if selected_wipe and selected_wipe != "No data found":
+                with st.spinner(f"Wiping {selected_wipe} from BigQuery..."):
+                    try:
+                        # BigQuery DML for deletion
+                        # We delete from both the data table and the migration log
+                        queries = [
+                            f"DELETE FROM `{PROJECT_ID}.{DATASET}.call_reports_financials` WHERE report_date = '{selected_wipe}'",
+                            f"DELETE FROM `{PROJECT_ID}.{DATASET}.migration_log` WHERE report_date = '{selected_wipe}'"
+                        ]
+                        
+                        for q in queries:
+                            client.query(q).result() # .result() waits for the job to finish
+                            
+                        st.success(f"Reset {selected_wipe}!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Wipe failed: {e}")
