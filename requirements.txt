@@ -9,3 +9,4 @@ streamlit
 webdriver-manager
 openpyxl
 db-dtypes
+google-genai
