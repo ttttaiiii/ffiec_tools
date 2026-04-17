@@ -1,0 +1,11 @@
+SQLAlchemy
+google-auth
+google-cloud-bigquery
+h2o
+pandas
+requests
+selenium
+streamlit
+webdriver-manager
+openpyxl
+db-dtypes
