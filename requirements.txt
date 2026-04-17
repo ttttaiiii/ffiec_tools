@@ -10,3 +10,4 @@ webdriver-manager
 openpyxl
 db-dtypes
 google-genai
+ollama
