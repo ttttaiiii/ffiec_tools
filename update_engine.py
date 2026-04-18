@@ -21,7 +21,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # System chromedriver — version-matched to Streamlit Cloud's Chromium install
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
-FFIEC_BULK_URL = "https://cdr.ffiec.gov/public/PDR/DownloadBulkReports.aspx"
+FFIEC_BULK_URL = "https://cdr.ffiec.gov/public/pws/downloadbulkdata.aspx"
 
 # --- Configuration Constants ---
 TABLE_FINANCIALS = "call_reports_financials"
