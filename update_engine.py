@@ -144,7 +144,7 @@ def run_bulk_download(download_dir, mode="new", start_date_str=None, end_date_st
             )
 
         Select(report_dropdown).select_by_visible_text(
-            "Call Reports -- Balance Sheet, Income Statement, Past Due"
+            "Call Reports -- Balance Sheet, Income Statement, Past Due -- Four Periods"
         )
 
         # ASP.NET postback — wait a bit then confirm dates dropdown is ready
