@@ -16,9 +16,11 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+# System chromedriver path — matches the Chromium version installed by packages.txt
+CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 
 # --- Configuration Constants ---
 TABLE_FINANCIALS = "call_reports_financials"
@@ -99,7 +101,7 @@ def run_bulk_download(download_dir, mode="new", start_date_str=None, end_date_st
     prefs = {"download.default_directory": download_dir}
     chrome_options.add_experimental_option("prefs", prefs)
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=chrome_options)
     wait = WebDriverWait(driver, 15) # Wait up to 15 seconds for elements
     
     try:
@@ -153,4 +155,4 @@ def run_bulk_parse(download_dir, client, project_id, dataset):
     Parses ZIPs and uses BigQuery Load Jobs for high-performance ingestion.
     Replaces row-by-row SQL with Pandas-based Batch Loading.
     """
-    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
+    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))  
