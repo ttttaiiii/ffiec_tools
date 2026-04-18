@@ -134,7 +134,7 @@ def run_bulk_download(download_dir, mode="new", start_date_str=None, end_date_st
         # Find the report dropdown — surface a diagnostic error if missing
         try:
             report_dropdown = wait.until(
-                EC.element_to_be_clickable((By.ID, "ReportTypeDropDownList"))
+                EC.element_to_be_clickable((By.ID, "ListBox1"))
             )
         except Exception:
             raise RuntimeError(
