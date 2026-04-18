@@ -19,8 +19,9 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# System chromedriver path — matches the Chromium version installed by packages.txt
+# System chromedriver — version-matched to Streamlit Cloud's Chromium install
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
+FFIEC_BULK_URL = "https://cdr.ffiec.gov/public/PDR/DownloadBulkReports.aspx"
 
 # --- Configuration Constants ---
 TABLE_FINANCIALS = "call_reports_financials"
@@ -92,60 +93,108 @@ def process_xml_worker_by_content(xml_content, report_date):
 
 def run_bulk_download(download_dir, mode="new", start_date_str=None, end_date_str=None):
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox") # Required for Linux root/sudo users
-    chrome_options.add_argument("--disable-dev-shm-usage") # Prevents crashes in Docker/VMs
-    chrome_options.add_argument("--window-size=1920,1080") # Forces a desktop layout
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
-    prefs = {"download.default_directory": download_dir}
+    chrome_options.add_argument("--headless=new")           # modern headless flag for Chrome 112+
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    )
+
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
     chrome_options.add_experimental_option("prefs", prefs)
-    
+
     driver = webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=chrome_options)
-    wait = WebDriverWait(driver, 15) # Wait up to 15 seconds for elements
-    
+    # Mask webdriver flag so ASP.NET sites do not detect and block headless Chrome
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
+    )
+
+    wait = WebDriverWait(driver, 45)  # generous timeout for Streamlit Cloud + FFIEC server
+
     try:
-        driver.get("https://cdr.ffiec.gov/public/PDR/DownloadBulkReports.aspx")
-        
-        # Wait for the specific dropdown to be present before selecting
-        report_dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportTypeDropDownList")))
+        yield ("Navigating to FFIEC download page...", 0.05)
+        driver.get(FFIEC_BULK_URL)
+
+        # Wait for full page load (ASP.NET pages can be slow)
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+        # Find the report dropdown — surface a diagnostic error if missing
+        try:
+            report_dropdown = wait.until(
+                EC.element_to_be_clickable((By.ID, "ReportTypeDropDownList"))
+            )
+        except Exception:
+            raise RuntimeError(
+                f"Could not find ReportTypeDropDownList after 45s. "
+                f"Page title: '{driver.title}'. "
+                f"Source snippet: {driver.page_source[:1500]}"
+            )
+
         Select(report_dropdown).select_by_visible_text(
             "Call Reports -- Balance Sheet, Income Statement, Past Due"
         )
-        
-        # Give the second dropdown a moment to refresh after the first selection
-        time.sleep(2)
-        date_dropdown_el = wait.until(EC.presence_of_element_located((By.ID, "DatesDropDownList")))
-        
-        all_options = [opt.text.strip() for opt in Select(date_dropdown_el).options if opt.text.strip()]
-        
-        # Apply your original filtering logic
+
+        # ASP.NET postback — wait a bit then confirm dates dropdown is ready
+        time.sleep(3)
+        date_dropdown_el = wait.until(
+            EC.element_to_be_clickable((By.ID, "DatesDropDownList"))
+        )
+
+        all_options = [
+            opt.text.strip()
+            for opt in Select(date_dropdown_el).options
+            if opt.text.strip()
+        ]
+
+        if not all_options:
+            raise RuntimeError("DatesDropDownList loaded but contained no date options.")
+
         target_dates = []
         if mode == "range":
             start_dt = get_date_objects(start_date_str)
             end_dt = get_date_objects(end_date_str)
-            target_dates = [opt for opt in all_options if get_date_objects(opt) and (start_dt <= get_date_objects(opt) <= end_dt)]
+            target_dates = [
+                opt for opt in all_options
+                if get_date_objects(opt) and (start_dt <= get_date_objects(opt) <= end_dt)
+            ]
         else:
-            # For 'new' mode, logic would typically check migration_log (handled in Home.py)
-            target_dates = all_options 
+            target_dates = all_options
 
         if not target_dates:
             yield ("No new data to download.", 1.0)
             return
-            
+
         for idx, target in enumerate(target_dates):
             current_progress = (idx / len(target_dates)) * 0.9 + 0.1
             yield (f"Downloading {target}...", current_progress)
-            
+
             Select(driver.find_element(By.ID, "DatesDropDownList")).select_by_visible_text(target)
             time.sleep(1)
-            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "Download_0"))
-            
-            # Wait for download to finish
-            time.sleep(5) 
-            while glob.glob(os.path.join(download_dir, "*.crdownload")):
+            driver.execute_script(
+                "arguments[0].click();",
+                driver.find_element(By.ID, "Download_0")
+            )
+
+            # Wait up to 2 minutes per file for download to finish
+            time.sleep(5)
+            for _ in range(60):
+                if not glob.glob(os.path.join(download_dir, "*.crdownload")):
+                    break
                 time.sleep(2)
-        
+
         yield ("Download complete.", 1.0)
     finally:
         driver.quit()
@@ -155,4 +204,4 @@ def run_bulk_parse(download_dir, client, project_id, dataset):
     Parses ZIPs and uses BigQuery Load Jobs for high-performance ingestion.
     Replaces row-by-row SQL with Pandas-based Batch Loading.
     """
-    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))  
+    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
