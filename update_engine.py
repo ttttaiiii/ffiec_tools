@@ -10,6 +10,7 @@ import datetime
 import xml.etree.ElementTree as ET
 from google.cloud import bigquery
 import streamlit as st
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -22,6 +23,18 @@ from selenium.webdriver.support import expected_conditions as EC
 # --- Configuration Constants ---
 TABLE_FINANCIALS = "call_reports_financials"
 TABLE_LOG = "migration_log"
+
+def get_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    
+    # In Streamlit Cloud, the driver is located at this path after adding it to packages.txt
+    service = Service("/usr/bin/chromedriver")
+    
+    return webdriver.Chrome(service=service, options=chrome_options)
 
 def wipe_period(report_date, client, project_id, dataset):
     """Deletes data for a specific period from BigQuery to allow for a clean re-run."""
